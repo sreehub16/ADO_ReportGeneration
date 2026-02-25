@@ -3,24 +3,26 @@
 #  ADO Repository Count Script (Bash)
 #  - Fetches all projects and repo counts
 #  - Outputs results to a CSV file
-#  - continuationToken-based repo pagination (no $skip loop)
+#  - continuationToken-based pagination (no $skip loop)
 #  - Retry-After header respected with exponential backoff
 #  - Safe throttle delays on every API call
 #  - Skipped/failed project error log
+#  - Safe for large orgs (600+ projects, 30k+ repos)
 # ============================================================
 
-set -euo pipefail
+# does not abort the entire run — errors are logged and skipped
+set -uo pipefail
 
 # ── Defaults (override via env vars or edit here) ─────────────────────────────
 ORG="${ADO_ORG:-Your_Azure_DevOps_Org}"
 PAT="${ADO_PAT:-Your_Personal_Access_Token}"
 OUTPUT_CSV="${OUTPUT_CSV:-ado_repo_counts.csv}"
 ERROR_LOG="${ERROR_LOG:-ado_repo_counts_errors.log}"
-DELAY_MS="${DELAY_MS:-250}"       # ms between every API call
+DELAY_MS="${DELAY_MS:-250}"
 MAX_RETRIES="${MAX_RETRIES:-6}"
 
 # ── Dependency check ──────────────────────────────────────────────────────────
-for cmd in curl jq awk; do
+for cmd in curl jq awk base64 mktemp; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "ERROR: '$cmd' is required but not installed." >&2
         exit 1
@@ -33,107 +35,117 @@ rm -f "$OUTPUT_CSV" "$ERROR_LOG"
 # ── Auth header ───────────────────────────────────────────────────────────────
 AUTH_HEADER="Authorization: Basic $(printf ':%s' "$PAT" | base64 | tr -d '\n')"
 
+# ── Temp file cleanup trap — runs on exit or kill ─────────────────────────────
+HEADERS_FILE=""
+cleanup() {
+    [ -n "$HEADERS_FILE" ] && rm -f "$HEADERS_FILE"
+}
+trap cleanup EXIT INT TERM
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 polite_delay() {
     sleep "$(awk "BEGIN {printf \"%.3f\", $DELAY_MS/1000}")"
 }
 
 log_error() {
-    local msg="$1"
     local ts
     ts=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$ts] $msg" >> "$ERROR_LOG"
-    echo "WARNING: $msg" >&2
+    echo "[$ts] $1" >> "$ERROR_LOG"
+    echo "WARNING: $1" >&2
+}
+
+# ── URL encode ────────────────────────────────────────────────────────────────
+url_encode() {
+    # tr -d '\r' handles Git Bash on Windows where \r can sneak into strings
+    printf '%s' "$1" | tr -d '\r' | jq -sRr @uri
 }
 
 # ── Core API wrapper ──────────────────────────────────────────────────────────
-# Usage: invoke_ado_api <url>
-# Prints JSON body to stdout.
-# Sets global CONTINUATION_TOKEN from x-ms-continuationtoken header or JSON body.
+# Prints JSON body to stdout on success.
+# Sets global CONTINUATION_TOKEN.
+# Returns 0 on success, 1 on failure.
 CONTINUATION_TOKEN=""
 
 invoke_ado_api() {
     local url="$1"
     local retry=0
-    local response headers_file body status_code
+    local response body status_code retry_after wait
 
-    headers_file=$(mktemp)
+    HEADERS_FILE=$(mktemp)
 
     while [ "$retry" -lt "$MAX_RETRIES" ]; do
-        # Dump response headers to temp file, body to stdout
         response=$(curl -s -w "%{http_code}" \
             -H "$AUTH_HEADER" \
             -H "Content-Type: application/json" \
-            -D "$headers_file" \
-            "$url" 2>/dev/null)
+            -D "$HEADERS_FILE" \
+            "$url" 2>/dev/null) || true
 
         status_code="${response: -3}"
-        body="${response%???}"   # strip last 3 chars (status code)
+        body="${response%???}"
 
-        if [ "$status_code" -eq 200 ]; then
-            # Extract continuation token — prefer header, fall back to JSON body
-            CONTINUATION_TOKEN=$(grep -i "x-ms-continuationtoken:" "$headers_file" \
-                | awk '{print $2}' | tr -d '\r\n' || true)
+        case "$status_code" in
+            200)
+                # Prefer header token, fall back to JSON body — strip \r on both
+                CONTINUATION_TOKEN=$(grep -i "x-ms-continuationtoken:" "$HEADERS_FILE" \
+                    | awk '{print $2}' | tr -d '\r\n' || true)
 
-            if [ -z "$CONTINUATION_TOKEN" ]; then
-                CONTINUATION_TOKEN=$(echo "$body" | jq -r '.continuationToken // empty' 2>/dev/null | tr -d '\r' || true)
-            fi
+                if [ -z "$CONTINUATION_TOKEN" ]; then
+                    CONTINUATION_TOKEN=$(printf '%s' "$body" \
+                        | jq -r '.continuationToken // empty' 2>/dev/null \
+                        | tr -d '\r' || true)
+                fi
 
-            rm -f "$headers_file"
-            echo "$body"
-            return 0
-        elif [ "$status_code" -eq 429 ] || [ "$status_code" -eq 503 ]; then
-            local retry_after
-            retry_after=$(grep -i "retry-after:" "$headers_file" \
-                | awk '{print $2}' | tr -d '\r\n' || true)
+                rm -f "$HEADERS_FILE"
+                HEADERS_FILE=""
+                printf '%s' "$body"
+                return 0
+                ;;
+            429|503)
+                retry_after=$(grep -i "retry-after:" "$HEADERS_FILE" \
+                    | awk '{print $2}' | tr -d '\r\n' || true)
 
-            local wait
-            if [ -n "$retry_after" ] && [ "$retry_after" -gt 0 ] 2>/dev/null; then
-                wait="$retry_after"
-            else
-                wait=$(awk "BEGIN {x=$((retry+1)); w=2^x; print (w>120?120:w)}")
-            fi
+                if [ -n "$retry_after" ] && [ "$retry_after" -gt 0 ] 2>/dev/null; then
+                    wait="$retry_after"
+                else
+                    wait=$(awk "BEGIN {x=$((retry+1)); w=2^x; print (w>120?120:w)}")
+                fi
 
-            echo "  [THROTTLED] HTTP $status_code — waiting ${wait}s before retry $((retry+1))/$MAX_RETRIES..." >&2
-            sleep "$wait"
-            retry=$((retry+1))
-        else
-            echo "  [API ERROR] HTTP $status_code — $url" >&2
-            rm -f "$headers_file"
-            return 1
-        fi
+                echo "  [THROTTLED] HTTP $status_code — waiting ${wait}s (retry $((retry+1))/$MAX_RETRIES)..." >&2
+                sleep "$wait"
+                retry=$((retry+1))
+                ;;
+            *)
+                echo "  [API ERROR] HTTP $status_code — $url" >&2
+                rm -f "$HEADERS_FILE"
+                HEADERS_FILE=""
+                return 1
+                ;;
+        esac
     done
 
-    rm -f "$headers_file"
+    rm -f "$HEADERS_FILE"
+    HEADERS_FILE=""
     echo "  [MAX RETRIES] Giving up on: $url" >&2
     return 1
 }
 
-# ── URL encode a string ───────────────────────────────────────────────────────
-url_encode() {
-    local string
-    string=$(printf '%s' "$1" | tr -d '\r')
-    printf '%s' "$string" | jq -sRr @uri
-}
-
 # =============================================================================
 #  STEP 1 — Fetch all projects via continuationToken pagination
+#  Projects are written to a temp file instead of an array to avoid
+#  bash array memory issues on systems with older bash versions
 # =============================================================================
 echo ""
 echo "Fetching projects..."
 
-# Write CSV header
 echo "Project,RepoCount" > "$OUTPUT_CSV"
 
-ALL_PROJECTS=()
+PROJECTS_FILE=$(mktemp)
 cont_token=""
 total_projects=0
 
 while true; do
     url="https://dev.azure.com/${ORG}/_apis/projects?\$top=100&api-version=7.1-preview.4"
-    if [ -n "$cont_token" ]; then
-        url="${url}&continuationToken=${cont_token}"
-    fi
+    [ -n "$cont_token" ] && url="${url}&continuationToken=${cont_token}"
 
     polite_delay
     body=$(invoke_ado_api "$url") || {
@@ -141,15 +153,15 @@ while true; do
         break
     }
 
-    # Extract project names
-    mapfile -t page_projects < <(echo "$body" | jq -r '.value[].name' | tr -d '\r')
+    # Write project names to temp file — one per line, \r stripped
+    page_count=$(printf '%s' "$body" | jq -r '.value[].name' | tr -d '\r' | tee -a "$PROJECTS_FILE" | wc -l)
+    page_count=$(echo "$page_count" | tr -d ' ')
 
-    if [ ${#page_projects[@]} -eq 0 ]; then
+    if [ "$page_count" -eq 0 ]; then
         break
     fi
 
-    ALL_PROJECTS+=("${page_projects[@]}")
-    total_projects=${#ALL_PROJECTS[@]}
+    total_projects=$((total_projects + page_count))
     echo "  Fetched $total_projects projects so far..."
 
     cont_token="$CONTINUATION_TOKEN"
@@ -159,59 +171,63 @@ done
 echo "Total projects found: $total_projects"
 
 # =============================================================================
-#  STEP 2 — For each project, fetch repo count via single API call
-#  Uses continuationToken if ADO paginates (safe for any repo count)
+#  STEP 2 — For each project fetch repo count via continuationToken pagination
+#  Safe for any repo count — no $skip, no infinite loop risk
 # =============================================================================
 total_repos=0
 total_skipped=0
 proj_index=0
 
-for proj_name in "${ALL_PROJECTS[@]}"; do
+while IFS= read -r proj_name; do
+    # Skip blank lines
+    [ -z "$proj_name" ] && continue
+
     proj_index=$((proj_index+1))
-    encoded_name=$(url_encode "$proj_name")
     repo_count=0
     page_num=0
     repo_cont_token=""
+    proj_failed=0
 
     echo ""
     echo "[$proj_index/$total_projects] $proj_name"
 
     while true; do
         page_num=$((page_num+1))
+        encoded_name=$(url_encode "$proj_name")
         url="https://dev.azure.com/${ORG}/${encoded_name}/_apis/git/repositories?api-version=7.1-preview.1"
-        if [ -n "$repo_cont_token" ]; then
-            url="${url}&continuationToken=${repo_cont_token}"
-        fi
+        [ -n "$repo_cont_token" ] && url="${url}&continuationToken=${repo_cont_token}"
 
         polite_delay
         body=$(invoke_ado_api "$url") || {
             log_error "SKIPPED project '$proj_name' on page $page_num — API returned null"
             total_skipped=$((total_skipped+1))
-            repo_count=-1   # sentinel so we skip CSV write
+            proj_failed=1
             break
         }
 
-        count=$(echo "$body" | jq '.value | length')
+        count=$(printf '%s' "$body" | jq '.value | length')
         repo_count=$((repo_count+count))
-
         echo "  Page $page_num — $count repos (running total: $repo_count)"
 
         repo_cont_token="$CONTINUATION_TOKEN"
         [ -z "$repo_cont_token" ] && break
     done
 
-    # Skip CSV write if project failed
-    if [ "$repo_count" -eq -1 ]; then
+    # Skip CSV write if this project failed — don't write partial counts
+    if [ "$proj_failed" -eq 1 ]; then
         continue
     fi
 
     total_repos=$((total_repos+repo_count))
     echo "  Total repos: $repo_count"
 
-    # Append to CSV — escape project name for CSV safety
+    # CSV-safe project name — escape any double quotes
     safe_name=$(printf '%s' "$proj_name" | sed 's/"/""/g')
-    echo "\"${safe_name}\",${repo_count}" >> "$OUTPUT_CSV"
-done
+    printf '"%s",%d\n' "$safe_name" "$repo_count" >> "$OUTPUT_CSV"
+
+done < "$PROJECTS_FILE"
+
+rm -f "$PROJECTS_FILE"
 
 # =============================================================================
 #  SUMMARY
