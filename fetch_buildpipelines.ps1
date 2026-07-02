@@ -330,6 +330,7 @@ function Get-BuildPipelinesForProject {
             $pipelineRows.Add([PSCustomObject]@{
                 Project      = $ProjectName
                 Repository   = $repoName
+                PipelineId   = $def.id
                 PipelineName = $def.name
                 PipelineType = $pipelineType
                 PipelineUrl  = if ($def._links -and $def._links.web) { $def._links.web.href } else { "" }
@@ -405,6 +406,7 @@ function Get-ReleasePipelinesForProject {
             $pipelineRows.Add([PSCustomObject]@{
                 Project      = $ProjectName
                 Repository   = ""
+                PipelineId   = $def.id
                 PipelineName = $def.name
                 PipelineType = "Classic Release"
                 PipelineUrl  = if ($def._links -and $def._links.web) { $def._links.web.href } else { "" }
